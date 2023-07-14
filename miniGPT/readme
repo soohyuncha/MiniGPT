@@ -1,0 +1,22 @@
+This is a pytorch-level implementation of GPT-2
+
+################################
+## Reference
+################################
+1. Paper reference
+    SpAtten
+
+2. Github
+    1) Huggingface Official
+        https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py#L124
+    2) Simple GPT-2
+        https://github.com/Andras7/gpt2-pytorch/blob/master/gpt_trainer.py
+    3) 
+        https://github.com/graykode/gpt-2-Pytorch/blob/master/GPT2/model.py
+
+#################################
+## Implementation Details
+#################################
+1. Dataset
+    - WikiText2 from torchtext
+    - language modeling(=text generation)
