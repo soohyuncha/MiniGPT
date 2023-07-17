@@ -20,11 +20,11 @@ class PositionEncodingLayer(nn.Module) :
     def _get_pos_angle_vec(self, pos, d_model) :
         return np.array([pos / np.power(10000, (2*(i//2)) / d_model) for i in range(d_model)])
     
-    def forward(self, x) :
+    def forward(self, x, start, end) :
         # input x: (batch_size, seq_len, d_model)
         # pe_table: (max_len, d_model)
         # output: (batch_size, seq_len, d_model)
-        x = x + self.pe_table[:x.size(1)].clone().detach()
+        x = x + self.pe_table[start:end].clone().detach()
         return x
 
 class ScaledDotProductAttention(nn.Module):
@@ -113,7 +113,7 @@ class MultiHeadAttention(nn.Module):
         x = x.view(new_shape)
         return x
 
-    def forward(self, x):
+    def forward(self, x, layer_past=None):
         # Generate 3 matrix: Q (query), K (key), V (value)
         # (batch_size, seq_len, d_model)
         q = self.fc_query(x)
@@ -126,6 +126,15 @@ class MultiHeadAttention(nn.Module):
         k = self._split_head(k, self.n_head, self.head_dim)
         v = self._split_head(v, self.n_head, self.head_dim)
 
+        # If there exists cached K, V
+        if layer_past != None:
+            # past_k, past_v: (batch_size, n_head, n, head_dim)
+            past_k, past_v = layer_past[0], layer_past[1]
+            # concatenate; (batch_size, n_head, n+1, head_dim)
+            k, v = torch.cat((past_k, k), dim=-2), torch.cat((past_v, v), dim=-2)
+        # Caching K, V
+        present = torch.stack((k, v))
+
         # attn_out: (batch_size, n_head, seq_len, head_dim)
         attn_out = self.attention(q, k, v)
 
@@ -136,7 +145,7 @@ class MultiHeadAttention(nn.Module):
         # (batch_size, seq_len, d_model)
         out = self.fc(attn_out)
         out = self.dropout_layer(out)
-        return out
+        return out, present
 
 class DecoderBlock(nn.Module):
     def __init__(self, d_model, d_hidden, n_head, dropout, device):
@@ -146,13 +155,13 @@ class DecoderBlock(nn.Module):
         self.layer_norm_2 = nn.LayerNorm(d_model)
         self.ffn = FeedForwardNetwork(d_model, d_hidden, dropout)
 
-    def forward(self, x):
+    def forward(self, x, layer_past=None):
         # Input: (batch_size, seq_len, d_model)
         # Output: (batch_size, seq_len, d_model)
 
         # Multi-head attention
         residual = x
-        attn_x = self.attention(self.layer_norm_1(x))
+        attn_x, present = self.attention(self.layer_norm_1(x), layer_past=layer_past)
         x = residual + attn_x
 
         # Feed forward network
@@ -160,7 +169,7 @@ class DecoderBlock(nn.Module):
         ffn_x = self.ffn(self.layer_norm_2(x))
         out = residual + ffn_x
 
-        return out
+        return out, present
 
 class miniGPT(nn.Module) :
     def __init__(self, vocab_size, max_len, d_model, d_hidden, n_layer, n_head, device) :
@@ -181,27 +190,37 @@ class miniGPT(nn.Module) :
 
         self.fc = nn.Linear(d_model, vocab_size, bias=False)
 
-    def forward(self, x) :
+    def forward(self, x, past=None) :
+        if past is None:
+            past_length = 0
+            past = [None] * len(self.decoder_stack)
+        else:
+            past_length = past[0][0].size(-2)
         # Input: (batch_size, seq_len)
         # Output: (batch_size, seq_len, d_model)
-
+        
         # Embedding
         # (batch_size, seq_len) -> (batch_size, seq_len, d_model)
         x = self.embedding(x)
-        x = self.position_encoding(x)
+        x = self.position_encoding(x, start=past_length, end=past_length+x.size(-2))
         x = self.dropout_layer(x)
 
         # Decoder stack
-        for dec_block in self.decoder_stack:
-            x = dec_block(x)
-            
+        presents = []
+        for dec_block, layer_past in zip(self.decoder_stack, past):
+            # layer_past: (2, batch_size, n_head, n, head_dim)
+            # present: (2, batch_size, n_head, n, head_dim)
+            x, present = dec_block(x, layer_past)
+            # presents: (n_layer, 2, batch_size, n_head, n, head_dim)
+            presents.append(present)
+           
         # Layer normalization
         # (batch_size, seq_len, d_model)
         hidden_state = self.decoder_layer_norm(x)
 
         # Output: (batch_size, seq_len, vocab_size)
         out = self.fc(hidden_state)
-        return out
+        return out, presents
 
 def train(model, train_loader, epochs, log_interval, device='cpu') :
     # Training algorithms
@@ -214,8 +233,12 @@ def train(model, train_loader, epochs, log_interval, device='cpu') :
 
     batch_num = len(train_loader)
     total_loss = 0
+
+    print('|------------------------------------------|')
+    print('\t Start training', epochs, 'epochs')
+    print('|------------------------------------------|')
     start_training = time.time()
-    print('## Start training', epochs, 'epochs \n')
+
     for epoch in range(epochs) :
         start = time.time()
         for batch_idx, data in enumerate(train_loader):
@@ -229,7 +252,8 @@ def train(model, train_loader, epochs, log_interval, device='cpu') :
             targets = data[:, 1:].contiguous().view(-1)
             
             # output: (batch_size, chunk_size, vocab_size) -> (batch_size*chunk_size, vocab_size)
-            output = model(input_ids).contiguous()
+            output, _ = model(input_ids)
+            output = output.contiguous()
             output = output.view(output.size(0)*output.size(1), -1)
             
             loss = criterion(output, targets)
@@ -251,14 +275,18 @@ def train(model, train_loader, epochs, log_interval, device='cpu') :
     end_training = time.time()
     print(f'> Training done with {end_training-start_training: .2f} sec')
 
-def evaluate_loss(model, test_loader, device='cpu'):
+def evaluate(model, test_loader, device='cpu'):
     model.eval()
     criterion = nn.CrossEntropyLoss().to(device)
 
+    print('|------------------------------------------|')
+    print('\t Start evaluation')
+    print('|------------------------------------------|')
+
     start = time.time()
-    print('## Start evaluation of loss')
+
     total_loss = 0
-    batch_cnt = len(test_loader)
+    
     with torch.no_grad():
         for batch_idx, data in enumerate(test_loader):
             data = data.to(device)
@@ -266,7 +294,8 @@ def evaluate_loss(model, test_loader, device='cpu'):
             targets = data[:, 1:].contiguous().view(-1)
             
             # output: (batch_size, chunk_size, vocab_size) -> (batch_size*chunk_size, vocab_size)
-            output = model(input_ids).contiguous()
+            output, _ = model(input_ids)
+            output = output.contiguous()
             output = output.view(output.size(0)*output.size(1), -1)
             
             loss = criterion(output, targets)
@@ -274,8 +303,11 @@ def evaluate_loss(model, test_loader, device='cpu'):
 
     end = time.time()
     
+    avg_loss = total_loss / len(test_loader)
+    perplexity = torch.exp(torch.tensor(avg_loss)).item()
     print(f'> Evaluation done with {end-start: .2f} sec')
-    print(f'  Avg. loss: {total_loss/batch_cnt: .3f}')
+    print(f'  Avg. loss: {avg_loss: .3f}')
+    print(f'  Perplexity: {perplexity: .3f}')
     print('\n')
 
 def generate_test_sentence(model, test_loader, tokenizer, vocab, n_batch, chunk_size, device='cpu'):
@@ -285,22 +317,21 @@ def generate_test_sentence(model, test_loader, tokenizer, vocab, n_batch, chunk_
     print('## Start generation of sentence from test dataset')
     with torch.no_grad():
         for batch_idx, data in enumerate(test_loader):
-            print(f'> {batch_idx+1} th batch')
             input_ids = data[:, :chunk_size // 2]
             
             for i in range(data.size(0)):
                 prompt_seq = ' '.join([idx_to_token[x] for x in data[i, :chunk_size // 2]])
+                ans_seq = ' '.join([idx_to_token[x] for x in data[i, chunk_size // 2:]])                
 
-                ans_seq = []
-                for idx in data[i, chunk_size//2:]:
-                    if idx == 1:
-                        break
-                    ans_seq.append(idx_to_token[idx])
-                ans_seq = ' '.join(ans_seq)
-
-                gen_seq = generate(model, list(data[i, :chunk_size // 2].numpy()), chunk_size // 2, vocab=vocab, attn_print=False, device=device) 
+                # Generate with generate() function
+                gen_seq = generate(model=model,
+                        prompt=prompt_seq,
+                        max_gen_len=chunk_size // 2,
+                        vocab=vocab,
+                        tokenizer=tokenizer,
+                        device=device) 
                 
-                print(f' {i+1}/{data.size(0)} th sample')
+                print(f'> Batch {batch_idx+1} th, Sample {i+1}/{data.size(0)} th')
                 print('\t > Prompt:', prompt_seq, '\n')
                 print('\t > Answer sentence:', ans_seq, '\n')
                 print('\t > Generated sentence:', gen_seq, '\n')
@@ -310,54 +341,43 @@ def generate_test_sentence(model, test_loader, tokenizer, vocab, n_batch, chunk_
 
 
 
-def generate(model, prompt, max_gen_len, vocab, attn_print=False, device='cpu'):
-    # prompt: list
+def generate(model, prompt, max_gen_len, vocab, tokenizer, device='cpu'):
+    # prompt: sequence of words
+    # 'Hi my name is generative ...'
     model.eval()
     gen_seq_idx = []
     gen_seq_token = []
+
+    token_to_idx = vocab.get_stoi()
     idx_to_token = vocab.get_itos()
+    tokenized_prompt = vocab(tokenizer(prompt))
 
     with torch.no_grad():
+        past = None
         for i in range(max_gen_len):
             # (seq_len) -> (1, seq_len)
-            input_ids = torch.tensor(prompt, device=device).unsqueeze(0)
+            input_ids = torch.tensor(tokenized_prompt, device=device).unsqueeze(0)
         
-            output = model(input_ids)
+            # caching previous K, V in 'past'
+            output, past = model(input_ids, past=past)
             # convert into cpu
             # don't need to pass it to any torch library
             output = output.cpu()
-            max_idx = output[0][-1].argmax()
+            # 1th element of batch; last element of sequence;
+            max_idx = output[0][-1].argmax().item()
 
-            prompt.append(max_idx.item())
-            gen_seq_idx.append(max_idx.item())
+            #prompt.append(max_idx.item())
+            tokenized_prompt = [max_idx]
+
+            gen_seq_idx.append(max_idx)
             
-            
-            if max_idx == 1:
+            # eos token
+            if max_idx == token_to_idx['<pad>']:
                 break
 
     gen_seq_token = ' '.join([idx_to_token[x] for x in gen_seq_idx])
 
-    if attn_print:
-        prompt_seq_token = [idx_to_token[x] for x in prompt]
-        print_len = min(10, len(prompt_seq_token[:-1]))
-        # get attention probability of last layer
-        attn = attn[-1].numpy()
-
-        print('\t\t', end='')
-        for i in range(print_len):
-            key = prompt_seq_token[i]
-            print(key, end='\t')
-        print()
-
-        for i in range(print_len):
-            query = prompt_seq_token[i]
-            print(query, end='\t\t')
-            prob = attn[i]
-            for j in range(print_len):
-                p = prob[j]
-                print(round(p, 2), end='\t')
-            print()
-
+    
     # return: string (=raw sentence)
     return gen_seq_token
 

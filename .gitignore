@@ -161,3 +161,4 @@ cython_debug/
 
 miniGPT/model
 miniGPT/data
+miniGPT/model_initial.py
